@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Acer Nitro V16 Battery Health Control Driver
@@ -15,6 +14,8 @@
 #include <linux/version.h>
 #include <linux/wmi.h>
 #include <linux/mutex.h>
+#include <linux/device.h>
+#include <linux/slab.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 #include <asm/unaligned.h>
@@ -23,11 +24,6 @@
 #endif
 
 #define WMI_GUID "79772EC5-04B1-4BFD-843C-61E7F77B6CC9"
-
-#ifdef pr_fmt
-#undef pr_fmt
-#endif
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 MODULE_DESCRIPTION("Acer Nitro V16 battery health control driver");
 MODULE_AUTHOR("Qapky <qapkyy3@gmail.com>");
@@ -38,37 +34,41 @@ MODULE_ALIAS("wmi:" WMI_GUID);
 #define ACER_BATTERY_INDEX	0x1
 
 /* WMI method IDs */
-#define WMI_METHOD_GET_BATTERY_INFO	19 // 0x13 -> BEBI
-#define WMI_METHOD_GET_HEALTH_STATUS	20 // 0x20 -> BEGB
-#define WMI_METHOD_SET_HEALTH_CONTROL	21 // 0x15 -> BESB
+#define WMI_METHOD_GET_BATTERY_INFO	19 /* 0x13 -> BEBI */
+#define WMI_METHOD_GET_HEALTH_STATUS	20 /* 0x14 -> BEGB */
+#define WMI_METHOD_SET_HEALTH_CONTROL	21 /* 0x15 -> BESB */
 #define WMI_HEALTH_STATUS_BUF_LEN	8
 #define WMI_SET_CONTROL_BUF_LEN		4
 #define WMI_BATTERY_INFO_BUF_LEN	sizeof(u32)
+
+/* Sub-index used with WMI_METHOD_GET_BATTERY_INFO to read temperature */
+#define BATTERY_INFO_TEMPERATURE	0x8
+
 #define TEMP_OFFSET_DK		2731	/* 0°C in decikelvin */
 #define TEMP_DK_TO_MILLI_C(dk)	(((dk) - TEMP_OFFSET_DK) * 100)
 
 struct get_battery_health_control_status_input {
-	u8 uBatteryNo;
-	u8 uFunctionQuery;
-	u8 uReserved[2];
+	u8 battery_no;
+	u8 function_query;
+	u8 reserved[2];
 } __packed;
 
 struct get_battery_health_control_status_output {
-	u8 uFunctionList;
-	u8 uReturn[2];
-	u8 uFunctionStatus[5];
+	u8 function_list;
+	u8 ret[2];
+	u8 function_status[5];
 } __packed;
 
 struct set_battery_health_control_input {
-	u8 uBatteryNo;
-	u8 uFunctionMask;
-	u8 uFunctionStatus;
-	u8 uReservedIn[5];
+	u8 battery_no;
+	u8 function_mask;
+	u8 function_status;
+	u8 reserved_in[5];
 } __packed;
 
 struct set_battery_health_control_output {
-	u8 uReturn;
-	u8 uReservedOut;
+	u8 ret;
+	u8 reserved_out;
 } __packed;
 
 enum battery_mode {
@@ -81,19 +81,24 @@ struct battery_info {
 	s8 calibration_mode;	/* -1: unsupported, 0: off, 1: on */
 };
 
-static struct battery_info battery_status;
-static DEFINE_MUTEX(state_lock);
+/* Per-device driver state, attached to the wmi_device via drvdata */
+struct acer_battery_data {
+	struct wmi_device *wdev;
+	struct battery_info status;
+	struct mutex lock;
+};
 
 static short enable_health_mode = -1;
-module_param(enable_health_mode, short, 0664);
+module_param(enable_health_mode, short, 0444);
 MODULE_PARM_DESC(enable_health_mode,
-	"Set battery health mode at init: >0 enables, 0 disables, <0 (default) keeps current setting");
+	"Set battery health mode at probe time: >0 enables, 0 disables, <0 (default) keeps current setting");
 
 /* ------------------------------------------------------------------ */
 /* WMI helpers                                                          */
 /* ------------------------------------------------------------------ */
 
-static acpi_status get_battery_information(u32 index, u32 battery, u32 *result)
+static acpi_status get_battery_information(struct wmi_device *wdev, u32 index,
+					    u32 battery, u32 *result)
 {
 	u32 args[2] = { index, battery };
 	struct acpi_buffer input  = { sizeof(args), args };
@@ -101,9 +106,8 @@ static acpi_status get_battery_information(u32 index, u32 battery, u32 *result)
 	union acpi_object *obj;
 	acpi_status status;
 
-	status = wmi_evaluate_method(WMI_GUID, 0,
-				     WMI_METHOD_GET_BATTERY_INFO,
-				     &input, &output);
+	status = wmidev_evaluate_method(wdev, 0, WMI_METHOD_GET_BATTERY_INFO,
+					&input, &output);
 	if (ACPI_FAILURE(status))
 		return status;
 
@@ -112,15 +116,15 @@ static acpi_status get_battery_information(u32 index, u32 battery, u32 *result)
 		return AE_ERROR;
 
 	if (obj->type != ACPI_TYPE_BUFFER) {
-		pr_err("Unexpected WMI object type %u (expected BUFFER)\n",
-		       obj->type);
+		dev_err(&wdev->dev, "Unexpected WMI object type %u (expected BUFFER)\n",
+			obj->type);
 		kfree(obj);
 		return AE_ERROR;
 	}
 
 	if (obj->buffer.length < WMI_BATTERY_INFO_BUF_LEN) {
-		pr_err("WMI battery info buffer too short: %u bytes\n",
-		       obj->buffer.length);
+		dev_err(&wdev->dev, "WMI battery info buffer too short: %u bytes\n",
+			obj->buffer.length);
 		kfree(obj);
 		return AE_ERROR;
 	}
@@ -132,12 +136,13 @@ static acpi_status get_battery_information(u32 index, u32 battery, u32 *result)
 }
 
 static acpi_status
-get_battery_health_control_status(struct battery_info *bat_status)
+get_battery_health_control_status(struct wmi_device *wdev,
+				  struct battery_info *bat_status)
 {
 	struct get_battery_health_control_status_input params = {
-		.uBatteryNo    = ACER_BATTERY_INDEX,
-		.uFunctionQuery = 0x1,
-		.uReserved     = { 0x0, 0x0 },
+		.battery_no     = ACER_BATTERY_INDEX,
+		.function_query = 0x1,
+		.reserved       = { 0x0, 0x0 },
 	};
 	struct get_battery_health_control_status_output ret;
 	struct acpi_buffer input  = { sizeof(params), &params };
@@ -145,9 +150,8 @@ get_battery_health_control_status(struct battery_info *bat_status)
 	union acpi_object *obj;
 	acpi_status status;
 
-	status = wmi_evaluate_method(WMI_GUID, 0,
-				     WMI_METHOD_GET_HEALTH_STATUS,
-				     &input, &output);
+	status = wmidev_evaluate_method(wdev, 0, WMI_METHOD_GET_HEALTH_STATUS,
+					&input, &output);
 	if (ACPI_FAILURE(status))
 		return status;
 
@@ -156,15 +160,15 @@ get_battery_health_control_status(struct battery_info *bat_status)
 		return AE_ERROR;
 
 	if (obj->type != ACPI_TYPE_BUFFER) {
-		pr_err("Unexpected WMI object type %u (expected BUFFER)\n",
-		       obj->type);
+		dev_err(&wdev->dev, "Unexpected WMI object type %u (expected BUFFER)\n",
+			obj->type);
 		kfree(obj);
 		return AE_ERROR;
 	}
 
 	if (obj->buffer.length < WMI_HEALTH_STATUS_BUF_LEN) {
-		pr_err("WMI health status buffer too short: %u (need %u)\n",
-		       obj->buffer.length, WMI_HEALTH_STATUS_BUF_LEN);
+		dev_err(&wdev->dev, "WMI health status buffer too short: %u (need %u)\n",
+			obj->buffer.length, WMI_HEALTH_STATUS_BUF_LEN);
 		kfree(obj);
 		return AE_ERROR;
 	}
@@ -173,23 +177,24 @@ get_battery_health_control_status(struct battery_info *bat_status)
 	kfree(obj);
 
 	bat_status->health_mode =
-		(ret.uFunctionList & HEALTH_MODE) ?
-		(ret.uFunctionStatus[0] > 0 ? 1 : 0) : -1;
+		(ret.function_list & HEALTH_MODE) ?
+		(ret.function_status[0] > 0 ? 1 : 0) : -1;
 
 	bat_status->calibration_mode =
-		(ret.uFunctionList & CALIBRATION_MODE) ?
-		(ret.uFunctionStatus[1] > 0 ? 1 : 0) : -1;
+		(ret.function_list & CALIBRATION_MODE) ?
+		(ret.function_status[1] > 0 ? 1 : 0) : -1;
 
 	return AE_OK;
 }
 
-static acpi_status set_battery_health_control(u8 function, bool function_status)
+static acpi_status set_battery_health_control(struct wmi_device *wdev,
+					      u8 function, bool function_status)
 {
 	struct set_battery_health_control_input params = {
-		.uBatteryNo     = ACER_BATTERY_INDEX,
-		.uFunctionMask  = function,
-		.uFunctionStatus = (u8)function_status,
-		.uReservedIn    = { 0x0, 0x0, 0x0, 0x0, 0x0 },
+		.battery_no      = ACER_BATTERY_INDEX,
+		.function_mask   = function,
+		.function_status = (u8)function_status,
+		.reserved_in     = { 0x0, 0x0, 0x0, 0x0, 0x0 },
 	};
 	struct set_battery_health_control_output ret;
 	struct acpi_buffer input  = { sizeof(params), &params };
@@ -197,9 +202,8 @@ static acpi_status set_battery_health_control(u8 function, bool function_status)
 	union acpi_object *obj;
 	acpi_status status;
 
-	status = wmi_evaluate_method(WMI_GUID, 0,
-				     WMI_METHOD_SET_HEALTH_CONTROL,
-				     &input, &output);
+	status = wmidev_evaluate_method(wdev, 0, WMI_METHOD_SET_HEALTH_CONTROL,
+					&input, &output);
 	if (ACPI_FAILURE(status))
 		return status;
 
@@ -208,15 +212,15 @@ static acpi_status set_battery_health_control(u8 function, bool function_status)
 		return AE_ERROR;
 
 	if (obj->type != ACPI_TYPE_BUFFER) {
-		pr_err("Unexpected WMI object type %u (expected BUFFER)\n",
-		       obj->type);
+		dev_err(&wdev->dev, "Unexpected WMI object type %u (expected BUFFER)\n",
+			obj->type);
 		kfree(obj);
 		return AE_ERROR;
 	}
 
 	if (obj->buffer.length < WMI_SET_CONTROL_BUF_LEN) {
-		pr_err("WMI set control buffer too short: %u (need %u)\n",
-		       obj->buffer.length, WMI_SET_CONTROL_BUF_LEN);
+		dev_err(&wdev->dev, "WMI set control buffer too short: %u (need %u)\n",
+			obj->buffer.length, WMI_SET_CONTROL_BUF_LEN);
 		kfree(obj);
 		return AE_ERROR;
 	}
@@ -224,9 +228,9 @@ static acpi_status set_battery_health_control(u8 function, bool function_status)
 	memcpy(&ret, obj->buffer.pointer, sizeof(ret));
 	kfree(obj);
 
-	if (ret.uReturn != 0) {
-		pr_err("Firmware rejected set_battery_health_control: error 0x%02x\n",
-		       ret.uReturn);
+	if (ret.ret != 0) {
+		dev_err(&wdev->dev, "Firmware rejected set_battery_health_control: error 0x%02x\n",
+			ret.ret);
 		return AE_ERROR;
 	}
 
@@ -237,81 +241,61 @@ static acpi_status set_battery_health_control(u8 function, bool function_status)
 /* State management                                                     */
 /* ------------------------------------------------------------------ */
 
-static void print_modes(const char *prefix, bool print_if_empty,
-			bool health_mode, bool calib_mode)
+static void print_modes(struct device *dev, const char *prefix,
+			bool print_if_empty, bool health_mode, bool calib_mode)
 {
 	if (!health_mode && !calib_mode && !print_if_empty)
 		return;
 
-	pr_info("%s modes:%s%s%s\n",
+	dev_info(dev, "%s modes:%s%s%s\n",
 		prefix,
 		health_mode               ? " health"      : "",
 		health_mode && calib_mode ? ","            : "",
 		calib_mode                ? " calibration" : "");
 }
 
-static acpi_status init_state(void)
-{
-	acpi_status status;
-
-	mutex_lock(&state_lock);
-	status = get_battery_health_control_status(&battery_status);
-	mutex_unlock(&state_lock);
-
-	if (ACPI_FAILURE(status)) {
-		pr_err("Failed to query initial battery status\n");
-		return status;
-	}
-
-	print_modes("available", true,
-		    battery_status.health_mode >= 0,
-		    battery_status.calibration_mode >= 0);
-	print_modes("active", false,
-		    battery_status.health_mode > 0,
-		    battery_status.calibration_mode > 0);
-
-	return AE_OK;
-}
-
-static void update_state(void)
+static void update_state(struct acer_battery_data *data)
 {
 	struct battery_info old_state;
 	struct battery_info new_state;
 	acpi_status status;
 
-	mutex_lock(&state_lock);
-	old_state = battery_status;
-	mutex_unlock(&state_lock);
+	mutex_lock(&data->lock);
+	old_state = data->status;
+	mutex_unlock(&data->lock);
 
-	status = get_battery_health_control_status(&new_state);
+	status = get_battery_health_control_status(data->wdev, &new_state);
 	if (ACPI_FAILURE(status)) {
-		pr_err("Failed to refresh battery status\n");
+		dev_err(&data->wdev->dev, "Failed to refresh battery status\n");
 		return;
 	}
 
-	mutex_lock(&state_lock);
-	battery_status = new_state;
-	mutex_unlock(&state_lock);
+	mutex_lock(&data->lock);
+	data->status = new_state;
+	mutex_unlock(&data->lock);
 
 	if (new_state.calibration_mode != old_state.calibration_mode)
-		pr_info("%s calibration mode\n",
+		dev_info(&data->wdev->dev, "%s calibration mode\n",
 			new_state.calibration_mode > 0 ? "enabled" : "disabled");
 
 	if (new_state.health_mode != old_state.health_mode)
-		pr_info("%s health mode\n",
+		dev_info(&data->wdev->dev, "%s health mode\n",
 			new_state.health_mode > 0 ? "enabled" : "disabled");
 }
 
 /* ------------------------------------------------------------------ */
-/* sysfs attributes                                                     */
+/* sysfs attributes (per-device)                                        */
 /* ------------------------------------------------------------------ */
 
-static ssize_t temperature_show(struct device_driver *driver, char *buf)
+static ssize_t temperature_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
+	struct acer_battery_data *data = dev_get_drvdata(dev);
 	acpi_status status;
 	u32 value;
 
-	status = get_battery_information(0x8, ACER_BATTERY_INDEX, &value);
+	status = get_battery_information(data->wdev, BATTERY_INFO_TEMPERATURE,
+					  ACER_BATTERY_INDEX, &value);
 	if (ACPI_FAILURE(status))
 		return -EIO;
 
@@ -321,149 +305,186 @@ static ssize_t temperature_show(struct device_driver *driver, char *buf)
 	return sysfs_emit(buf, "%d\n", TEMP_DK_TO_MILLI_C(value));
 }
 
-static ssize_t health_mode_show(struct device_driver *driver, char *buf)
+static ssize_t health_mode_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
+	struct acer_battery_data *data = dev_get_drvdata(dev);
 	ssize_t ret;
 
-	mutex_lock(&state_lock);
-	ret = sysfs_emit(buf, "%d\n", battery_status.health_mode);
-	mutex_unlock(&state_lock);
+	mutex_lock(&data->lock);
+	ret = sysfs_emit(buf, "%d\n", data->status.health_mode);
+	mutex_unlock(&data->lock);
 
 	return ret;
 }
 
-static ssize_t health_mode_store(struct device_driver *driver,
+static ssize_t health_mode_store(struct device *dev,
+				 struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
+	struct acer_battery_data *data = dev_get_drvdata(dev);
 	acpi_status status;
 	bool param_val;
 	int err;
 
-	mutex_lock(&state_lock);
-	if (battery_status.health_mode < 0) {
-		mutex_unlock(&state_lock);
-		pr_warn("health mode not supported on this battery\n");
+	mutex_lock(&data->lock);
+	if (data->status.health_mode < 0) {
+		mutex_unlock(&data->lock);
+		dev_warn(dev, "health mode not supported on this battery\n");
 		return -EOPNOTSUPP;
 	}
-	mutex_unlock(&state_lock);
+	mutex_unlock(&data->lock);
 
 	err = kstrtobool(buf, &param_val);
 	if (err)
 		return err;
 
-	status = set_battery_health_control(HEALTH_MODE, param_val);
+	status = set_battery_health_control(data->wdev, HEALTH_MODE, param_val);
 	if (ACPI_FAILURE(status)) {
-		pr_err("Failed to set health mode\n");
+		dev_err(dev, "Failed to set health mode\n");
 		return -EIO;
 	}
 
-	update_state();
+	update_state(data);
 
 	return count;
 }
 
-static ssize_t calibration_mode_show(struct device_driver *driver, char *buf)
+static ssize_t calibration_mode_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
 {
+	struct acer_battery_data *data = dev_get_drvdata(dev);
 	ssize_t ret;
 
-	mutex_lock(&state_lock);
-	ret = sysfs_emit(buf, "%d\n", battery_status.calibration_mode);
-	mutex_unlock(&state_lock);
+	mutex_lock(&data->lock);
+	ret = sysfs_emit(buf, "%d\n", data->status.calibration_mode);
+	mutex_unlock(&data->lock);
 
 	return ret;
 }
 
-static ssize_t calibration_mode_store(struct device_driver *driver,
+static ssize_t calibration_mode_store(struct device *dev,
+				      struct device_attribute *attr,
 				      const char *buf, size_t count)
 {
+	struct acer_battery_data *data = dev_get_drvdata(dev);
 	acpi_status status;
 	bool param_val;
 	int err;
 
-	mutex_lock(&state_lock);
-	if (battery_status.calibration_mode < 0) {
-		mutex_unlock(&state_lock);
-		pr_warn("calibration mode not supported on this battery\n");
+	mutex_lock(&data->lock);
+	if (data->status.calibration_mode < 0) {
+		mutex_unlock(&data->lock);
+		dev_warn(dev, "calibration mode not supported on this battery\n");
 		return -EOPNOTSUPP;
 	}
-	mutex_unlock(&state_lock);
+	mutex_unlock(&data->lock);
 
 	err = kstrtobool(buf, &param_val);
 	if (err)
 		return err;
 
-	status = set_battery_health_control(CALIBRATION_MODE, param_val);
+	status = set_battery_health_control(data->wdev, CALIBRATION_MODE, param_val);
 	if (ACPI_FAILURE(status)) {
-		pr_err("Failed to set calibration mode\n");
+		dev_err(dev, "Failed to set calibration mode\n");
 		return -EIO;
 	}
 
-	update_state();
+	update_state(data);
 
 	return count;
 }
 
-static DRIVER_ATTR_RO(temperature);
-static DRIVER_ATTR_RW(health_mode);
-static DRIVER_ATTR_RW(calibration_mode);
+static DEVICE_ATTR_RO(temperature);
+static DEVICE_ATTR_RW(health_mode);
+static DEVICE_ATTR_RW(calibration_mode);
 
-static struct attribute *acer_wmi_battery_attrs[] = {
-	&driver_attr_temperature.attr,
-	&driver_attr_health_mode.attr,
-	&driver_attr_calibration_mode.attr,
+static struct attribute *acer_battery_attrs[] = {
+	&dev_attr_temperature.attr,
+	&dev_attr_health_mode.attr,
+	&dev_attr_calibration_mode.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(acer_wmi_battery);
+
+static const struct attribute_group acer_battery_group = {
+	.attrs = acer_battery_attrs,
+};
 
 /* ------------------------------------------------------------------ */
 /* WMI driver registration                                              */
 /* ------------------------------------------------------------------ */
 
-static const struct wmi_device_id acer_wmi_battery_id_table[] = {
-	{ .guid_string = WMI_GUID },
-	{ },
-};
-MODULE_DEVICE_TABLE(wmi, acer_wmi_battery_id_table);
-
-static struct wmi_driver acer_wmi_battery_driver = {
-	.driver = {
-		.name   = "acer-wmi-battery",
-		.groups = acer_wmi_battery_groups,
-	},
-	.id_table = acer_wmi_battery_id_table,
-};
-
-static int __init acer_battery_init(void)
+static int acer_battery_probe(struct wmi_device *wdev, const void *context)
 {
+	struct acer_battery_data *data;
 	acpi_status status;
+	int ret;
 
-	if (!wmi_has_guid(WMI_GUID)) {
-		pr_err("Acer battery WMI GUID not found — unsupported hardware?\n");
-		return -ENODEV;
+	data = devm_kzalloc(&wdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	data->wdev = wdev;
+	mutex_init(&data->lock);
+	dev_set_drvdata(&wdev->dev, data);
+
+	status = get_battery_health_control_status(wdev, &data->status);
+	if (ACPI_FAILURE(status)) {
+		dev_err(&wdev->dev, "Failed to query initial battery status\n");
+		return -EIO;
 	}
 
+	print_modes(&wdev->dev, "available", true,
+		    data->status.health_mode >= 0,
+		    data->status.calibration_mode >= 0);
+	print_modes(&wdev->dev, "active", false,
+		    data->status.health_mode > 0,
+		    data->status.calibration_mode > 0);
+
 	if (enable_health_mode >= 0) {
-		status = set_battery_health_control(HEALTH_MODE,
-						    enable_health_mode > 0);
-		if (ACPI_FAILURE(status)) {
-			pr_err("Failed to apply enable_health_mode=%d at init\n",
-			       enable_health_mode);
-			return -EIO;
+		if (data->status.health_mode < 0) {
+			dev_warn(&wdev->dev,
+				 "health mode not supported, ignoring enable_health_mode parameter\n");
+		} else {
+			status = set_battery_health_control(wdev, HEALTH_MODE,
+							    enable_health_mode > 0);
+			if (ACPI_FAILURE(status))
+				dev_warn(&wdev->dev,
+					 "Failed to apply enable_health_mode=%d at probe\n",
+					 enable_health_mode);
+			else
+				update_state(data);
 		}
 	}
 
-	status = init_state();
-	if (ACPI_FAILURE(status))
-		return -EIO;
+	ret = devm_device_add_group(&wdev->dev, &acer_battery_group);
+	if (ret) {
+		dev_err(&wdev->dev, "Failed to create sysfs attributes\n");
+		return ret;
+	}
 
-	return wmi_driver_register(&acer_wmi_battery_driver);
+	return 0;
 }
 
-static void __exit acer_battery_exit(void)
+static void acer_battery_remove(struct wmi_device *wdev)
 {
-	wmi_driver_unregister(&acer_wmi_battery_driver);
+	struct acer_battery_data *data = dev_get_drvdata(&wdev->dev);
+
+	mutex_destroy(&data->lock);
 }
 
-module_init(acer_battery_init);
-module_exit(acer_battery_exit);
+static const struct wmi_device_id acer_battery_id_table[] = {
+	{ .guid_string = WMI_GUID },
+	{ },
+};
+MODULE_DEVICE_TABLE(wmi, acer_battery_id_table);
 
+static struct wmi_driver acer_battery_driver = {
+	.driver = {
+		.name = "wmi-battery-acer",
+	},
+	.id_table = acer_battery_id_table,
+	.probe    = acer_battery_probe,
+	.remove   = acer_battery_remove,
+};
+module_wmi_driver(acer_battery_driver);
