@@ -35,9 +35,9 @@ Ensure you have the necessary kernel headers and build tools installed on your d
   sudo dnf install kernel-devel kernel-headers development-tools
   ```
 - **Arch Linux:**
- ```
- sudo pacman -S base-devel linux-headers
- ```
+  ```
+  sudo pacman -S base-devel linux-headers
+  ```
 
 ## Clone and Compile
 Clone this repository and compile the kernel module using the provided Makefile:
