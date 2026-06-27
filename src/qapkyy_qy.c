@@ -175,8 +175,8 @@ enum interface_flags {
 #define ACER_CAP_TURBO_FAN          BIT(9)
 #define ACER_CAP_PLATFORM_PROFILE   BIT(10)
 #define ACER_CAP_FAN_SPEED_READ     BIT(11)
-#define ACER_CAP_NITRO_SENSE     BIT(12)
-#define ACER_CAP_NITRO_SENSE        BIT(13)
+#define ACER_CAP_NITRO_SENSE	    BIT(12)
+#define ACER_CAP_NITRO_SENSE_V4     BIT(13)
 #define ACER_CAP_NITRO_SENSE_V5     BIT(14)
 
 static const struct key_entry acer_wmi_keymap[] __initconst = {
@@ -1194,7 +1194,7 @@ static int acer_platform_profile_setup(struct platform_device *device)
 
 	for (retry = 0; retry < 10; retry++) {
 		platform_profile_device = devm_platform_profile_register(
-			&device->dev, "acer-wmi", NULL,
+			&device->dev, "qapkyy_qy", NULL,
 			&acer_nitro_v5_platform_profile_ops);
 
 		if (!IS_ERR(platform_profile_device)) {
@@ -1901,7 +1901,7 @@ static int acer_backlight_init(struct device *dev)
 	memset(&props, 0, sizeof(props));
 	props.type           = BACKLIGHT_PLATFORM;
 	props.max_brightness = max_brightness;
-	bd = backlight_device_register("acer-wmi", dev, NULL, &acer_bl_ops, &props);
+	bd = backlight_device_register("qapkyy_qy", dev, NULL, &acer_bl_ops, &props);
 	if (IS_ERR(bd)) {
 		pr_err("Could not register backlight device\n");
 		acer_backlight_device = NULL;
@@ -1944,7 +1944,7 @@ static u32 get_wmid_devices(void)
 
 static void __init create_debugfs(void)
 {
-	interface->debug.root = debugfs_create_dir("acer-wmi", NULL);
+	interface->debug.root = debugfs_create_dir("qapkyy_qy", NULL);
 	debugfs_create_u32("devices", S_IRUGO, interface->debug.root,
 			   &interface->debug.wmid_devices);
 }
@@ -2082,7 +2082,7 @@ static SIMPLE_DEV_PM_OPS(acer_pm, acer_suspend, acer_resume);
 
 static struct platform_driver acer_platform_driver = {
 	.driver = {
-		.name = "acer-wmi",
+		.name = "qapkyy_qy",
 		.pm   = &acer_pm,
 	},
 	.probe    = acer_platform_probe,
@@ -2180,7 +2180,7 @@ static int __init acer_wmi_init(void)
 		goto error_platform_register;
 	}
 
-	acer_platform_device = platform_device_alloc("acer-wmi", PLATFORM_DEVID_NONE);
+	acer_platform_device = platform_device_alloc("qapkyy_qy", PLATFORM_DEVID_NONE);
 	if (!acer_platform_device) {
 		err = -ENOMEM;
 		goto error_device_alloc;
